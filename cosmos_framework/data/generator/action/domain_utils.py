@@ -24,6 +24,13 @@ EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
     "molmoact2_yam": 16,  # MolmoAct2 uses the same YAM 20D FK action contract
     "fractal": 20,
     "drawanything": 21,
+    # HumanGen uses source-native action layouts, distinct from existing domains.
+    "humangen_robotwin": 22,
+    "humangen_agibot": 23,
+    "humangen_robocoin": 24,
+    "humangen_robomind": 25,
+    "humangen_interna1": 26,
+    "humangen_oxe": 27,
 }
 
 
@@ -46,7 +53,8 @@ EMBODIMENT_TO_RAW_ACTION_DIM: dict[str, int] = {
     "fractal": 10,
     "drawanything": 3,
     # NOTE: ``libero`` (7/10/13 depending on ``rotation_space``) and ``hand_pose``
-    # (variable with ``keypoint_option`` and ``rotation_format``) are absent
+    # (variable with ``keypoint_option`` and ``rotation_format``), and HumanGen
+    # sources (width depends on the source robot schema) are absent
     # because their raw width is set per-dataset at construction time. Inference
     # in inverse_dynamics/policy modes is not supported for these domains until
     # canonical widths are added here.

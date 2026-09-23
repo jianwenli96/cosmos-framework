@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
-from torch.distributed.fsdp import fully_shard, register_fsdp_forward_method
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard, register_fsdp_forward_method
 from torch.utils.checkpoint import (
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
@@ -391,6 +391,7 @@ def apply_replicated_attention_io_cp(
 def apply_fsdp(
     model: nn.Module,
     parallel_dims: ParallelDims,
+    mixed_precision_policy: MixedPrecisionPolicy | None = None,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -410,7 +411,11 @@ def apply_fsdp(
         parallel_dims (ParallelDims): The device mesh to use for data parallelism and expert parallel.
     """
     for _, block in model.model.layers.named_children():
-        fully_shard(block, mesh=parallel_dims.dp_mesh)
+        fully_shard(
+            block,
+            mesh=parallel_dims.dp_mesh,
+            **({"mp_policy": mixed_precision_policy} if mixed_precision_policy is not None else {}),
+        )
         register_fsdp_forward_method(block, "reasoner_forward")
 
 
@@ -420,6 +425,7 @@ def parallelize_unified_mot(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     attention_io_layout: str = "sequence_sharded",
+    mixed_precision_policy: MixedPrecisionPolicy | None = None,
 ) -> nn.Module:
     """Optimize the model using CP, FSDP, activation checkpointing, and torch.compile.
 
@@ -452,5 +458,5 @@ def parallelize_unified_mot(
     if compile_config.enabled:
         apply_compile(model, compile_config)
     if parallel_dims is not None and parallel_dims.dp_enabled:
-        apply_fsdp(model, parallel_dims)
+        apply_fsdp(model, parallel_dims, mixed_precision_policy)
     return model

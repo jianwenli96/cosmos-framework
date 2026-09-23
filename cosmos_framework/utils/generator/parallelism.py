@@ -99,8 +99,11 @@ class ParallelDims:
         # dp_enabled off, and silently disables FSDP for
         # data_parallel_shard_degree=-1 runs (e.g. test_smoke.py).
         if self.dp_shard <= 0:
-            self.dp_shard = self.world_size
-            log.info(f"dp_shard auto-inferred to world_size = {self.world_size}")
+            replicas = max(1, self.dp_replicate)
+            if self.world_size % replicas:
+                raise ValueError("WORLD_SIZE must be divisible by dp_replicate")
+            self.dp_shard = self.world_size // replicas
+            log.info(f"dp_shard auto-inferred to {self.dp_shard}")
         elif self.dp_shard > self.world_size:
             # Clamp + warn rather than fail-fast: a mis-sized launch (e.g. an 8-way
             # FSDP config on a 4-GPU smoke) will silently run a different topology

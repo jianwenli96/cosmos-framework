@@ -44,6 +44,7 @@ def custom_collate_fn(batch):
         "action_raw",
         "domain_id",
         "sequence_plan",
+        "video_segment_frames",
         "sound",
         "raw_action_dim",
         "image_size",
@@ -433,7 +434,12 @@ class JointDataLoader(webdataset.WebLoader):
             latent_w_shape = W // self.tokenizer_spatial_compression_factor
             patch_h_shape = math.ceil(latent_h_shape / self.patch_spatial)
             patch_w_shape = math.ceil(latent_w_shape / self.patch_spatial)
-            if sample_n_views is not None and frames_per_view is not None and not is_image_batch:
+            if "video_segment_frames" in data_batch and not is_image_batch:
+                lengths = data_batch["video_segment_frames"]
+                if len(lengths) != 2 or sum(lengths) != T:
+                    raise ValueError("Independent video segment lengths must sum to the raw video length")
+                latent_t_shape = sum(self._compute_vision_latent_t_shape(n, H, W) for n in lengths)
+            elif sample_n_views is not None and frames_per_view is not None and not is_image_batch:
                 # The multiview dataset resizes every camera to the same H/W and
                 # selects the same synchronized frame count before concatenating
                 # the camera-major clips along T.
@@ -744,6 +750,8 @@ class RankPartitionedDataLoader:
     def __init__(
         self,
         datasets: dict[str, dict[str, Any]],
+        distributed_shuffle: bool = False,
+        shuffle_seed: int = 42,
         **dataloader_kwargs: Any,
     ):
         """
@@ -759,6 +767,11 @@ class RankPartitionedDataLoader:
             **dataloader_kwargs: Default kwargs forwarded to
                 ``torch.utils.data.DataLoader``. ``collate_fn`` defaults to
                 ``custom_collate_fn`` if not given.
+
+            distributed_shuffle: Stream shuffled epochs of a map-style dataset,
+                partitioned across its assigned ranks. Drops the shuffled tail
+                rather than padding duplicate samples to equalize rank lengths.
+            shuffle_seed: Shared seed; each epoch uses seed + epoch.
         """
         world_size = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
@@ -838,12 +851,42 @@ class RankPartitionedDataLoader:
 
         merged_kwargs = {**dataloader_kwargs, **per_dataset_kwargs[my_dataset_idx]}
         merged_kwargs.setdefault("collate_fn", custom_collate_fn)
+        self.shuffle_sampler = None
+        self.shuffle_epoch = 0
+        if distributed_shuffle:
+            if isinstance(dataset, torch.utils.data.IterableDataset):
+                raise ValueError("distributed_shuffle requires a map-style dataset")
+            if merged_kwargs.get("sampler") is not None or merged_kwargs.get("shuffle", False):
+                raise ValueError("distributed_shuffle owns the sampler and shuffle settings")
+            if len(dataset) < shard_world_size:
+                raise ValueError("distributed_shuffle needs at least one sample per dataset rank")
+            self.shuffle_sampler = torch.utils.data.DistributedSampler(
+                dataset,
+                num_replicas=shard_world_size,
+                rank=shard_rank,
+                shuffle=True,
+                seed=shuffle_seed,
+                drop_last=True,
+            )
+            merged_kwargs["sampler"] = self.shuffle_sampler
         self.dataloader = torch.utils.data.DataLoader(dataset, **merged_kwargs)
+        if distributed_shuffle and len(self.dataloader) == 0:
+            raise ValueError("distributed_shuffle produced no batches; reduce batch_size or disable drop_last")
         self.dataset_name = names[my_dataset_idx]
         self.dataset = dataset
 
     def __iter__(self):
+        if self.shuffle_sampler is not None:
+            return self._iter_shuffled()
         return iter(self.dataloader)
+
+    def _iter_shuffled(self):
+        # PackingDataLoader retains its inner iterator. Stream successive epochs
+        # here so it does not stall permanently after the first finite epoch.
+        while True:
+            self.shuffle_sampler.set_epoch(self.shuffle_epoch)
+            yield from self.dataloader
+            self.shuffle_epoch += 1
 
     def __len__(self) -> int:
         return len(self.dataloader)

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import torch
-from torch.distributed.fsdp import fully_shard, register_fsdp_forward_method
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard, register_fsdp_forward_method
 
 from cosmos_framework.configs.base.defaults.activation_checkpointing import ActivationCheckpointingConfig
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
@@ -48,6 +48,7 @@ def parallelize_vfm_network(
     compile_config: CompileConfig,
     ac_config: ActivationCheckpointingConfig,
     attention_io_layout: str = "sequence_sharded",
+    mixed_precision_policy: MixedPrecisionPolicy | None = None,
 ) -> torch.nn.Module:
     """Optimize the model using FSDP, CP, activation checkpointing, and torch.compile.
 
@@ -75,6 +76,7 @@ def parallelize_vfm_network(
         compile_config=compile_config,
         ac_config=ac_config,
         attention_io_layout=attention_io_layout,
+        mixed_precision_policy=mixed_precision_policy,
     )
 
     if compile_config.enabled and compile_config.compiled_region == "all":
@@ -88,6 +90,7 @@ def parallelize_vfm_network(
             module=model,
             mesh=parallel_dims.dp_mesh,
             ignored_params=ignored_params,
+            **({"mp_policy": mixed_precision_policy} if mixed_precision_policy is not None else {}),
         )
 
         # Make ``model.generate_reasoner_text(...)`` trigger the same

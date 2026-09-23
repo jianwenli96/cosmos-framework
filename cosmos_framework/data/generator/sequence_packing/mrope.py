@@ -82,7 +82,7 @@ def get_3d_mrope_ids_vae_tokens(
     base_fps: float = 24.0,
     temporal_compression_factor: int = 4,
     base_temporal_compression_factor: int | None = None,
-    start_frame_offset: int = 0,
+    start_frame_offset: float = 0,
     temporal_positions: torch.Tensor | None = None,
     actual_temporal_compression_factor: int | None = None,
 ) -> tuple[torch.Tensor, int | float]:

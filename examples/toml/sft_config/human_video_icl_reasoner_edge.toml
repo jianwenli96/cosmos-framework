@@ -1,0 +1,42 @@
+[job]
+task       = "vfm"
+experiment = "human_video_icl_reasoner_edge"
+project    = "cosmos3_action"
+group      = "humangen"
+name       = "human_video_icl_reasoner_edge"
+wandb_mode = "offline"
+
+# 常用训练参数显式配置；数据接线和训练参数选择规则由 Python 配方定义。
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree = -1
+data_parallel_replicate_degree = 1
+
+[optimizer]
+optimizer_type = "AdamW"
+lr = 5.0e-5
+betas = [0.9, 0.99]
+eps = 1.0e-8
+weight_decay = 0.05
+fused = true
+
+[scheduler]
+cycle_lengths = [15000]
+warm_up_steps = [150]
+
+[trainer]
+max_iter = 15000
+logging_iter = 10
+grad_accum_iter = 1
+
+[dataloader_train]
+max_samples_per_batch = 1
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 2000

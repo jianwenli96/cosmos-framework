@@ -122,13 +122,15 @@ def pack_input_sequence(
             f"{vision_temporal_position_mode}. Supported modes: {supported_vision_temporal_position_modes}."
         )
     has_any_vision = any(plan.has_vision for plan in sequence_plans)
-    explicit_vision_temporal_positions_active = vision_temporal_position_mode != "latent_index" and has_any_vision
+    configured_explicit_positions = vision_temporal_position_mode != "latent_index" and has_any_vision
+    sample_explicit_positions = has_any_vision and gen_data_clean.temporal_positions_vision is not None
+    explicit_vision_temporal_positions_active = configured_explicit_positions or sample_explicit_positions
+    if configured_explicit_positions and gen_data_clean.temporal_positions_vision is None:
+        raise ValueError(
+            f"vision_temporal_position_mode={vision_temporal_position_mode} requires "
+            "gen_data_clean.temporal_positions_vision."
+        )
     if explicit_vision_temporal_positions_active:
-        if gen_data_clean.temporal_positions_vision is None:
-            raise ValueError(
-                f"vision_temporal_position_mode={vision_temporal_position_mode} requires "
-                "gen_data_clean.temporal_positions_vision."
-            )
         if gen_data_clean.x0_tokens_vision is not None and len(gen_data_clean.temporal_positions_vision) != len(
             gen_data_clean.x0_tokens_vision
         ):
@@ -141,7 +143,7 @@ def pack_input_sequence(
             raise NotImplementedError(
                 "video_temporal_causal=True is not wired for explicit UniAE vision temporal positions yet."
             )
-        if any(plan.has_action for plan in sequence_plans):
+        if configured_explicit_positions and any(plan.has_action for plan in sequence_plans):
             raise NotImplementedError("Action packing is not wired for explicit UniAE vision temporal positions yet.")
         if initial_mrope_temporal_offset != 0:
             raise NotImplementedError(

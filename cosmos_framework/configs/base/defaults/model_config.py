@@ -146,6 +146,8 @@ class OmniMoTModelConfig:
     # ``model.precision`` for LowPrecisionCallback). One of "bfloat16",
     # "float16", "float32".
     precision: str = "bfloat16"
+    # Opt-in FP32 FSDP master parameters with low-precision forward weights.
+    fsdp_mixed_precision: bool = False
 
     # LoRA (parameter-efficient fine-tuning). When `lora_enabled=True`,
     # `OmniMoTModel.build_net` injects custom LoRA adapters BEFORE FSDP wrap on

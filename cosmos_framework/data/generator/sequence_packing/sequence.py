@@ -348,7 +348,7 @@ class PackedSequenceBuilder:
         base_fps: float = 24.0,
         action_fps: float | None = None,
         base_temporal_compression_factor: int | None = None,
-        action_start_frame_offset: int = 1,
+        action_start_frame_offset: float = 1,
     ) -> int:
         """Pack action tokens into the sequence.
 
@@ -900,6 +900,8 @@ class PackedSequence:
     uses_single_timestep: bool = False
     sequence_length: int = 0
 
+    reasoner_video_inputs: list[dict | None] | None = None
+
     # Text modality
     text_ids: torch.Tensor = field(default_factory=_empty_long_tensor)
     text_indexes: torch.Tensor = field(default_factory=_empty_long_tensor)
@@ -1010,6 +1012,7 @@ class SequencePlan:
 
     # -- understanding (text conditioning) --
     has_text: bool
+    reasoner_video_input: dict | None = field(default=None, repr=False, compare=False, kw_only=True)
 
     # -- vision modality --
     has_vision: bool = False
@@ -1025,7 +1028,9 @@ class SequencePlan:
     # -- action modality --
     has_action: bool = False
     condition_frame_indexes_action: list[int] = field(default_factory=list)
-    action_start_frame_offset: int = 1
+    action_start_frame_offset: float = 1
+    # Optional exact sampled-video coordinates in source-frame / 4 units.
+    vision_temporal_positions: list[float] | None = None
 
     # -- sound modality --
     has_sound: bool = False

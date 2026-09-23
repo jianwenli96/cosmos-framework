@@ -543,6 +543,10 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             tuple of (packed_sequence, target_dtype) where packed_sequence has text embeddings filled in.
         """
         packed_text_embedding = self.language_model.model.embed_tokens(packed_seq.text_ids)  # [N_text,hidden_size]
+        if packed_seq.reasoner_video_inputs is not None:
+            from cosmos_framework.model.generator.reasoner.icl_conditioning import inject_reasoner_video
+
+            packed_text_embedding = inject_reasoner_video(packed_seq, packed_text_embedding)
         packed_sequence = packed_text_embedding.new_zeros(
             size=(packed_seq.sequence_length, self.hidden_size)
         )  # [N_total,hidden_size]

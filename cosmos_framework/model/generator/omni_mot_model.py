@@ -188,7 +188,6 @@ class OmniMoTModel(ImaginaireModel):
         else:
             self.tokenizer_sound_gen = None
 
-
     def build_net(self, dtype: torch.dtype, *, lora_enabled: bool | None = None) -> torch.nn.Module:
         # Build model network and parallelize it.
         lora_enabled = self.config.lora_enabled if lora_enabled is None else lora_enabled
@@ -248,16 +247,27 @@ class OmniMoTModel(ImaginaireModel):
 
         self.install_attention_dispatch(net)
 
+        mixed_precision_policy = None
+        if self.config.fsdp_mixed_precision:
+            from torch.distributed.fsdp import MixedPrecisionPolicy
+
+            if self.parallel_dims is None or not self.parallel_dims.dp_enabled:
+                raise ValueError("fsdp_mixed_precision requires FSDP data parallelism")
+            mixed_precision_policy = MixedPrecisionPolicy(
+                param_dtype=dtype, reduce_dtype=torch.float32, cast_forward_inputs=False
+            )
+
         net = parallelize_vfm_network(
             net,
             parallel_dims=self.parallel_dims,
             compile_config=self.config.compile,
             ac_config=self.config.activation_checkpointing,
             attention_io_layout=self.config.parallelism.attention_io_layout,
+            mixed_precision_policy=mixed_precision_policy,
         )
 
         with misc.timer("meta to cuda and broadcast model states"):
-            net = net.to(dtype=dtype)
+            net = net.to(dtype=torch.float32 if self.config.fsdp_mixed_precision else dtype)
             net.to_empty(device=DEVICE)
             if DEVICE in (Device.CUDA, Device.NPU):
                 # Weight initialization is not needed for other devices (cpu,
@@ -416,6 +426,7 @@ class OmniMoTModel(ImaginaireModel):
             enable_inference_mode=self.config.parallelism.enable_inference_mode,
             world_size=torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
             dp_shard=self.config.parallelism.data_parallel_shard_degree,
+            dp_replicate=self.config.parallelism.data_parallel_replicate_degree,
             cfgp=self.config.parallelism.cfg_parallel_shard_degree,
             cp=self.config.parallelism.context_parallel_shard_degree,
         )
@@ -592,7 +603,7 @@ class OmniMoTModel(ImaginaireModel):
         plus three optional flags.
         """
         assert self.tokenizer_vision_gen is not None
-        return pack_input_sequence(
+        packed = pack_input_sequence(
             sequence_plans=sequence_plans,
             input_text_indexes=input_text_indexes,
             gen_data_clean=gen_data_clean,
@@ -612,13 +623,17 @@ class OmniMoTModel(ImaginaireModel):
             action_dim=self.config.max_action_dim,
             initial_mrope_temporal_offset=initial_mrope_temporal_offset,
         )
+        media = [plan.reasoner_video_input for plan in sequence_plans]
+        if any(item is not None for item in media) and not skip_text_tokens:
+            packed.reasoner_video_inputs = media
+        return packed
 
     def _get_temporal_positions_vision(
         self,
         raw_state_vision: list[torch.Tensor],
         x0_tokens_vision: list[torch.Tensor],
         num_views_per_vision_item: list[int] | None = None,
-        frames_per_vision_item: list[int] | None = None,
+        frames_per_vision_item: list[int | list[int]] | None = None,
     ) -> list[torch.Tensor] | None:
         """Return optional per-latent temporal coordinates for vision tokens.
 
@@ -838,7 +853,7 @@ class OmniMoTModel(ImaginaireModel):
 
         # Get data from raw data batch and tokenize into corresponding tokens for *generation* task
         # The unnoised, tokenized data for the generation task.
-        gen_data_clean = self.get_data_and_condition(data_batch, iteration=iteration)
+        gen_data_clean = self.get_data_and_condition(data_batch, iteration=iteration, sequence_plans=sequence_plans)
 
         gen_data_clean, memory_info = self.memory_init_training(gen_data_clean, data_batch, input_text_indexes)
 
@@ -1705,6 +1720,14 @@ class OmniMoTModel(ImaginaireModel):
         :meth:`tokenize_text`) so there is a single source of truth for
         how raw captions become token ids.
         """
+        plans = data_batch.get("sequence_plan", [])
+        if any(plan.reasoner_video_input is not None for plan in plans):
+            cond = self._load_and_tokenize_text_data(data_batch, 0)
+            # ICL recipes use guidance=1; reject silent removal of visual placeholders.
+            if has_negative_prompt:
+                raise ValueError("Reasoner ICL currently supports guidance=1 without a negative prompt.")
+            return cond, cond
+
         use_system_prompt = self.vlm_config.use_system_prompt
         system_prompt: str | None = data_batch.get("system_prompt")
 
@@ -1795,7 +1818,9 @@ class OmniMoTModel(ImaginaireModel):
         # forward-dynamics condition latent frame 0 only, so only the first pixel frame
         # is encoded instead of the whole clip).
         vision_condition_indexes = [plan.condition_frame_indexes_vision for plan in sequence_plans]
-        gen_data_clean = self.get_data_and_condition(data_batch, vision_condition_indexes=vision_condition_indexes)
+        gen_data_clean = self.get_data_and_condition(
+            data_batch, vision_condition_indexes=vision_condition_indexes, sequence_plans=sequence_plans
+        )
 
         num_items_per_sample = gen_data_clean.num_vision_items_per_sample  # None for standard T2I/T2V
 
@@ -2554,6 +2579,10 @@ class OmniMoTModel(ImaginaireModel):
             ValueError: If the seed is a single integer. This is not supported anymore: `seed` must be
                 a list of integers, one for each sample.
         """
+        if any(plan.reasoner_video_input is not None for plan in data_batch.get("sequence_plan", [])):
+            if guidance != 1.0 or upsample_task is not None:
+                raise ValueError("Reasoner ICL requires guidance=1 and no prompt upsampling")
+
         if isinstance(seed, int):
             raise ValueError(
                 "Single integer seed is not supported anymore: `seed` must be a list of integers, one for each sample."
@@ -3164,8 +3193,17 @@ class OmniMoTModel(ImaginaireModel):
         data_batch: dict[str, Any],
         num_vision_items_per_sample: list[int] | None,
         batch_size: int,
-    ) -> tuple[list[int] | None, list[int] | None]:
+    ) -> tuple[list[int] | None, list[int | list[int]] | None]:
         """Align per-sample multiview metadata with flattened vision items."""
+        if "video_segment_frames" in data_batch:
+            segments = data_batch["video_segment_frames"]
+            if len(segments) != batch_size or num_vision_items_per_sample is not None:
+                raise ValueError("Independent video segments require one vision item per sample")
+            lengths = [[int(n) for n in item] for item in segments]
+            if any(len(item) != 2 or any(n < 5 or (n - 1) % 4 for n in item) for item in lengths):
+                raise ValueError("Independent video segments must contain two 4k+1 frame clips")
+            return [2] * batch_size, lengths
+
         if "enable_per_camera_vae_encoding" not in data_batch:
             return None, None
 
@@ -3203,7 +3241,7 @@ class OmniMoTModel(ImaginaireModel):
         state: torch.Tensor,
         *,
         num_views: int,
-        frames_per_view: int | None,
+        frames_per_view: int | list[int] | None,
     ) -> torch.Tensor:  # state: [B,C,T,H,W] or [C,T,H,W], returns [...,C_latent,T_latent,H_latent,W_latent]
         """Encode one vision item, splitting a camera-major multiview clip when needed.
 
@@ -3221,7 +3259,10 @@ class OmniMoTModel(ImaginaireModel):
 
         # The dataset concatenates full camera clips along T; confirm the shape.
         temporal_dim = state.ndim - 3
-        expected_frames = num_views * frames_per_view
+        lengths = frames_per_view if isinstance(frames_per_view, list) else [frames_per_view] * num_views
+        if len(lengths) != num_views or any(n < 1 for n in lengths):
+            raise ValueError("Invalid independent VAE segment lengths")
+        expected_frames = sum(lengths)
         actual_frames = int(state.shape[temporal_dim])
         if actual_frames != expected_frames:
             raise ValueError(
@@ -3231,14 +3272,16 @@ class OmniMoTModel(ImaginaireModel):
 
         # Encode each camera in a separate VAE call.
         encoded_views: list[torch.Tensor] = []
-        for view_idx in range(num_views):
+        offset = 0
+        for length in lengths:
             view_state = state.narrow(  # [...,C,T_v,H,W]
                 temporal_dim,
-                view_idx * frames_per_view,
-                frames_per_view,
+                offset,
+                length,
             )
-            encoded_view = self.encode(view_state).contiguous().float()  # [...,C_latent,T_latent_v,H_latent,W_latent]
+            encoded_view = self.encode(view_state).contiguous().float()
             encoded_views.append(encoded_view)
+            offset += length
 
         # Do camera-major repacking for now (instead of timestamp-major).
         return torch.cat(encoded_views, dim=temporal_dim)  # [...,C_latent,V*T_latent_v,H_latent,W_latent]
@@ -3249,7 +3292,7 @@ class OmniMoTModel(ImaginaireModel):
         num_vision_items_per_sample: list[int] | None,
         vision_condition_indexes: list[list[int]] | None,
         num_views_per_vision_item: list[int] | None = None,
-        frames_per_vision_item: list[int] | None = None,
+        frames_per_vision_item: list[int | list[int]] | None = None,
     ) -> list[torch.Tensor]:
         """Encode vision items into x0 latent tokens, optionally splitting camera views.
 
@@ -3401,6 +3444,7 @@ class OmniMoTModel(ImaginaireModel):
         data_batch: dict[str, torch.Tensor],
         iteration: int = 1,
         vision_condition_indexes: list[list[int]] | None = None,
+        sequence_plans: list[SequencePlan] | None = None,
     ) -> GenerationDataClean:
         """
         - Get raw data of different modalities from databatch
@@ -3492,6 +3536,34 @@ class OmniMoTModel(ImaginaireModel):
             num_views_per_vision_item=num_views_per_vision_item,
             frames_per_vision_item=frames_per_vision_item,
         )
+
+        # HumanGen can supply exact source-time coordinates for sparsely sampled
+        # robot video (and the generator-mode demonstration prefix). Route those
+        # coordinates through GenerationDataClean so the generic sequence packer
+        # remains the single place that constructs mRoPE IDs.
+        if sequence_plans is not None:
+            explicit_positions = [plan.vision_temporal_positions for plan in sequence_plans if plan.has_vision]
+            if any(positions is not None for positions in explicit_positions):
+                if num_vision_items_per_sample is not None:
+                    raise ValueError("Explicit sample temporal positions require one vision item per sample")
+                if len(explicit_positions) != len(x0_tokens_vision) or any(
+                    positions is None for positions in explicit_positions
+                ):
+                    raise ValueError("Explicit sample temporal positions must be present for every vision item")
+                temporal_positions_vision = []
+                for positions, latent in zip(explicit_positions, x0_tokens_vision, strict=True):
+                    assert positions is not None
+                    position_tensor = torch.as_tensor(
+                        positions,
+                        dtype=torch.float32,
+                        device=latent.device,
+                    )
+                    if position_tensor.ndim != 1 or position_tensor.shape[0] != latent.shape[2]:
+                        raise ValueError(
+                            "Explicit sample temporal positions must match encoded video length: "
+                            f"got {tuple(position_tensor.shape)} for latent T={latent.shape[2]}"
+                        )
+                    temporal_positions_vision.append(position_tensor)
 
         # Action – extract dense action / domain_id without mutating data_batch,
         # so downstream callbacks can still read the original per-sample domain_ids.
