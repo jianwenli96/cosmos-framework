@@ -60,6 +60,16 @@ def _model_overrides_from_training_config(checkpoint: str, mode: str) -> list[st
     return overrides
 
 
+def _window_options_from_training_config(checkpoint: str) -> dict:
+    saved = yaml.safe_load((_run_dir_from_checkpoint(checkpoint) / "config.yaml").read_text())
+    datasets = saved["dataloader_train"]["dataloader"]["datasets"]
+    dataset = next(iter(datasets.values()))["dataset"]
+    return {
+        "robot_window_frames": dataset.get("robot_window_frames", 0),
+        "robot_window_stride": dataset.get("robot_window_stride", 1),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["reasoner", "generator"], required=True)
@@ -72,11 +82,23 @@ def main():
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--condition-ablation", action="store_true")
+    parser.add_argument(
+        "--robot-window-frames",
+        type=int,
+        default=None,
+        help="Override checkpoint window length; 0 evaluates full pairs",
+    )
+    parser.add_argument("--robot-window-stride", type=int, default=None)
     args = parser.parse_args()
     if not args.root or not args.manifest:
         parser.error("--root/--manifest or HUMAN_GEN_ROOT/ICL_PAIR_MANIFEST are required")
 
     experiment_opts = _model_overrides_from_training_config(args.checkpoint, args.mode)
+    window_options = _window_options_from_training_config(args.checkpoint)
+    for key in window_options:
+        value = getattr(args, key)
+        if value is not None:
+            window_options[key] = value
     experiment_opts.extend(
         [
             f"model.config.tokenizer.vae_path={os.environ['WAN_VAE_PATH']}",
@@ -107,6 +129,7 @@ def main():
         resolution=config.model.config.resolution,
         max_action_dim=config.model.config.max_action_dim,
         tokenizer_config=config.model.config.vlm_config.tokenizer,
+        **window_options,
     )
     output = safe_output(dataset.manifest["root"], args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -145,6 +168,9 @@ def main():
             "index": index,
             "dataset_index": dataset_index,
             "pair_id": sample["pair_id"],
+            "sample_id": sample["sample_id"],
+            "robot_window_start": sample["robot_window_start"],
+            "robot_frame_ids": sample["robot_frame_ids"],
             "instruction": sample["ai_caption"],
             "action_mse": float(np.mean((action - target) ** 2)),
             "zero_action_mse": float(np.mean(target**2)),

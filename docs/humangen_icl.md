@@ -25,7 +25,35 @@ Reasoner 模式复用 Edge 的视觉编码器和多模态位置编码实现。�
 4. 所有机器人相机解码相同的源帧；人类示范按其缓存中的 `frame_ids` 解码。
 5. `SequencePlan.vision_temporal_positions` 保留精确源时间，支持非均匀采样，不强制把间隔当作固定整数步长。
 
-两种模式都保留所选人类示范序列。视频长度未设置统一上限，因此长片段可能占用较大显存；短样本冒烟测试不能证明全部长度均能训练。
+两种模式都保留 manifest 中完整的人类示范采样序列，不随 robot 窗口裁剪。
+
+### Robot 窗口训练
+
+两种训练配方默认 `robot_window_frames=17`、`robot_window_stride=1`。
+参考 LIBERO，用累计索引将每个配对展开为确定性的重叠窗口，在 manifest 的
+`robot_frame_ids` 序列上移动起点；每个窗口是独立训练样本，训练 loader 对窗口洗牌并分配给各 rank。
+例如 25 个采样帧、窗口 17 帧、步长 1，共 9 个窗口，起点为 0～8。
+步长单位是采样帧，不是原始控制帧；窗口不得跨配对边界。
+短于窗口的配对不产生样本，末尾不足一个窗口的部分不补帧，启动日志报告短配对数。
+
+窗口长度须为至少 5 的 `4k+1`；设为 0 恢复完整 robot 配对训练。
+首个 robot 观测作为条件，后续视频和窗口首末观测之间全部原生动作作为目标。
+时间位置以窗口起点重新计时，相对动作也以该起点状态重新计算。
+17 个视频帧不一定对应 16 个动作，例如控制频率 50 Hz、视频采样 12.5 Hz
+且均匀采样时，一个窗口监督 64 步动作。
+
+```bash
+ICL_MODE=reasoner NGPU=8 bash examples/train_humangen.sh \
+  job.name=humangen_reasoner_window17 \
+  dataloader_train.dataloader.datasets.humangen.dataset.robot_window_frames=17 \
+  dataloader_train.dataloader.datasets.humangen.dataset.robot_window_stride=1
+```
+
+`generator` 使用相同参数，多节点脚本也透传这些配置。现有 v4 manifest 无须重建。
+Dataset 构造函数默认窗口长度为 0，以兼容其他整段读取工具；训练配方显式启用 17 帧。
+改用窗口训练建议使用新运行名，避免自动恢复旧任务的优化器和训练步数。
+human 长度仍未设统一上限，原生动作长度也随源帧间隔变化，显存开销仍需实测。
+滑窗使中间状态成为训练条件；RoboTwin 在线闭环服务仍需单独接入和验证。
 
 ### 动作语义与归一化
 
@@ -110,8 +138,8 @@ NGPU=8 ICL_MODE=reasoner bash examples/train_humangen.sh job.name=humangen_reaso
 
 HumanGen 训练 loader 使用 `distributed_shuffle=True`，按 `trainer.seed + epoch`
 生成共同随机排列，再通过 DistributedSampler 分配给各 rank。每轮各 rank
-样本互不重叠，样本数相同；不能整除 rank 数的随机尾部丢弃（每轮最多
-`world_size - 1` 对），下一轮重新洗牌。样本数少于 rank 数时直接报错。
+窗口索引互不重复，样本数相同（不同重叠窗口仍可能包含相同源帧）；不能整除 rank 数的随机尾部丢弃（每轮最多
+`world_size - 1` 个窗口），下一轮重新洗牌。样本数少于 rank 数时直接报错。
 内部迭代器连续跨 epoch 读取，由 `trainer.max_iter` 控制训练结束。
 这与 map-style dataset 默认的逐 rank 全量顺序遍历不同。
 
@@ -128,7 +156,7 @@ ICL_MODE=generator NGPU=8 bash examples/train_humangen.sh \
 ```
 
 这两个数值仅为配置示例，不保证特定设备显存足够。默认 0 表示不限制。
-超限配对在所有 rank 上一致过滤，并记录保留数量；不截断视频或改变动作对齐。
+这两个 max 参数仍在展开窗口前按完整配对过滤；长 robot 配对即使能切出短窗口，也会被 max_robot_frames 排除。超限配对在所有 rank 上一致过滤，并记录保留数量。
 该过滤不限制原始动作行数，仍需实测长动作序列和长视频的内存开销。
 
 目前 checkpoint 恢复模型、优化器和训练步数，但此 loader 不保存 shuffle
@@ -153,6 +181,8 @@ ICL_MODE=generator NGPU=8 bash examples/infer_humangen.sh \
 ```
 
 Reasoner 验收将模式与运行名对应替换。首次加载基础权重需要配置 `BASE_CHECKPOINT_PATH`、`WAN_VAE_PATH`、`COSMOS3_EDGE_PROCESSOR_PATH`。推理要求 checkpoint 上方存在训练生成的 `config.yaml`，会检查模式并恢复 FP32 主参数选项、精度、分辨率和动作宽度；其他自定义结构修改仍需同步推理配置。
+
+推理默认从 checkpoint 的 config.yaml 恢复 robot 窗口长度和步长（旧 checkpoint 缺省为整段），可用 `--robot-window-frames`、`--robot-window-stride` 覆盖；`--robot-window-frames 0` 评估整段。metrics.json 记录窗口起点、源帧 ID 和独立 sample_id。
 
 推理输入会清零未来机器人像素和所有动作目标，保留人类示范与机器人首帧。Generator 输出先移除人类 latent 前缀，再单独解码机器人视频。输出包括 `action_*.npy`、`target_*.npy`、`robot_*.mp4`、`metrics.json`；消融模式记录移除示范内容后动作预测的变化。
 

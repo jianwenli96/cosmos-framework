@@ -295,6 +295,8 @@ class HumanGenPairedDataset(Dataset):
         tokenizer_config=None,
         max_robot_frames=0,
         max_human_frames=0,
+        robot_window_frames=0,
+        robot_window_stride=1,
     ):
         from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
         from cosmos_framework.utils.lazy_config import instantiate
@@ -325,6 +327,32 @@ class HumanGenPairedDataset(Dataset):
             held_out = [pair["pair_id"] for pair in self.pairs if is_robotwin_held_out(self.root, pair)]
             if held_out:
                 raise ValueError(f"Robotwin held-out tasks present in {split}: {held_out[:8]}")
+        if not isinstance(robot_window_frames, int) or (
+            robot_window_frames != 0 and (robot_window_frames < 5 or (robot_window_frames - 1) % 4)
+        ):
+            raise ValueError("robot_window_frames must be 0 (full pair) or 4k+1, at least 5")
+        if not isinstance(robot_window_stride, int) or robot_window_stride < 1:
+            raise ValueError("robot_window_stride must be a positive integer")
+        self.robot_window_frames = robot_window_frames
+        self.robot_window_stride = robot_window_stride
+        # Compact cumulative index, like LIBERO: no materialized copy per window.
+        counts = [
+            max(0, (len(pair["robot_frame_ids"]) - robot_window_frames) // robot_window_stride + 1)
+            if robot_window_frames
+            else 1
+            for pair in self.pairs
+        ]
+        self._window_counts = np.asarray(counts, dtype=np.int64)
+        self._window_cumulative = np.cumsum(self._window_counts)
+        if not len(self):
+            raise ValueError(f"No HumanGen windows for split {split}; reduce robot_window_frames")
+        from cosmos_framework.utils import log
+
+        log.info(
+            f"HumanGen {split}: {len(self.pairs)} pairs, {len(self)} samples, "
+            f"robot_window_frames={robot_window_frames}, stride={robot_window_stride}, "
+            f"short_pairs={sum(count == 0 for count in counts)}"
+        )
         self.mode, self.resolution = injection_mode, resolution
         self.max_action_dim = max_action_dim
         self.transform = ActionTransformPipeline(
@@ -337,15 +365,30 @@ class HumanGenPairedDataset(Dataset):
         self.processor = instantiate(tokenizer_config) if tokenizer_config is not None else None
 
     def __len__(self):
-        return len(self.pairs)
+        return int(self._window_cumulative[-1])
 
     def get_shuffle_blocks(self):
-        return [(i, 1) for i in range(len(self))]
+        return [
+            (int(end - count), int(count)) for end, count in zip(self._window_cumulative, self._window_counts) if count
+        ]
+
+    def _window_pair(self, index):
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        pair_index = int(np.searchsorted(self._window_cumulative, index, side="right"))
+        base = int(self._window_cumulative[pair_index - 1]) if pair_index else 0
+        offset = (index - base) * self.robot_window_stride
+        pair = self.pairs[pair_index]
+        if self.robot_window_frames:
+            pair = dict(pair, robot_frame_ids=pair["robot_frame_ids"][offset : offset + self.robot_window_frames])
+        return pair, int(offset)
 
     def __getitem__(self, index):
         from cosmos_framework.data.generator.action.icl_transforms import inject_human_video
 
-        pair = self.pairs[index]
+        pair, window_offset = self._window_pair(index)
         repo = (self.root / pair["parquet"]).parents[2]
         contract = action_camera_contract(str(repo), pair["source"])
         table = _table(str(self.root / pair["parquet"]), action_table_columns(contract))
@@ -394,6 +437,9 @@ class HumanGenPairedDataset(Dataset):
         human = decode_frames(human_path, indexes)
         human = self.transform.video_resize(dict(video=human), self.resolution)["video"]
         robot["pair_id"] = pair["pair_id"]
+        robot["robot_window_start"] = window_offset
+        robot["robot_frame_ids"] = frame_ids.tolist()
+        robot["sample_id"] = f"{pair['pair_id']}:robot_window:{window_offset}:{len(frame_ids)}"
         robot["robot_camera_keys"] = list(contract["cameras"])
         robot["robot_camera_count"] = len(contract["cameras"])
         robot["robot_source_frames"] = source_frames

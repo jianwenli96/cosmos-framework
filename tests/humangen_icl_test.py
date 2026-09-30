@@ -205,7 +205,10 @@ def test_action_only_sampling_does_not_decode():
 def test_inference_recovers_structural_model_options_from_trainer_config(tmp_path):
     import yaml
 
-    from cosmos_framework.scripts.infer_icl_policy import _model_overrides_from_training_config
+    from cosmos_framework.scripts.infer_icl_policy import (
+        _model_overrides_from_training_config,
+        _window_options_from_training_config,
+    )
 
     run = tmp_path / "run"
     checkpoint = run / "checkpoints" / "iter_000000002" / "model"
@@ -223,6 +226,19 @@ def test_inference_recovers_structural_model_options_from_trainer_config(tmp_pat
     }
     (run / "config.yaml").write_text(yaml.safe_dump(config))
 
+    assert _window_options_from_training_config(str(checkpoint)) == {
+        "robot_window_frames": 0,
+        "robot_window_stride": 1,
+    }
+    config["dataloader_train"]["dataloader"]["datasets"]["humangen"]["dataset"].update(
+        robot_window_frames=17,
+        robot_window_stride=2,
+    )
+    (run / "config.yaml").write_text(yaml.safe_dump(config))
+    assert _window_options_from_training_config(str(checkpoint)) == {
+        "robot_window_frames": 17,
+        "robot_window_stride": 2,
+    }
     overrides = _model_overrides_from_training_config(str(checkpoint), "generator")
     assert "model.config.fsdp_mixed_precision=true" in overrides
     assert 'model.config.precision="float32"' in overrides

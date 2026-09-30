@@ -68,9 +68,9 @@ def _human_video_icl_recipe(mode: str):
     loader["max_samples_per_batch"] = 1
     loader["dataloader"].update(
         batch_size=1,
-        num_workers=1,
-        prefetch_factor=1,
-        pin_memory=False,
+        num_workers=2,
+        prefetch_factor=2,
+        pin_memory=True,
         in_order=True,
         distributed_shuffle=True,
         shuffle_seed="${trainer.seed}",
@@ -83,6 +83,8 @@ def _human_video_icl_recipe(mode: str):
                 manifest="${oc.env:ICL_PAIR_MANIFEST}",
                 injection_mode=mode,
                 split="train",
+                robot_window_frames=17,
+                robot_window_stride=1,
                 max_robot_frames=0,
                 max_human_frames=0,
                 resolution="${model.config.resolution}",

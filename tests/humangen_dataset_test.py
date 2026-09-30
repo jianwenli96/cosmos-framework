@@ -554,3 +554,97 @@ def test_action_stats_falls_back_to_collection_metadata(dataset_tree):
     contract = build_contract(repo, "agibot")
     assert contract["q99"] == [20.0] * 14
     assert str(repo.parent / "meta/action_stats.json") in contract["provenance"]
+
+
+@pytest.mark.parametrize("mode", ["generator", "reasoner"])
+def test_robot_windows_keep_full_human_and_native_actions(dataset_tree, tmp_path, mode):
+    from types import SimpleNamespace
+
+    class Processor:
+        def apply_chat_template(self, messages, **kwargs):
+            return "instruction"
+
+        def __call__(self, **kwargs):
+            assert kwargs["videos"][0].shape[0] == 9
+            assert kwargs["videos_kwargs"]["video_metadata"][0]["frames_indices"] == list(range(9))
+            return dict(
+                input_ids=torch.zeros(1, 2, dtype=torch.long),
+                pixel_values_videos=torch.zeros(9, 1),
+                video_grid_thw=torch.tensor([[9, 1, 1]]),
+            )
+
+    manifest = build_humangen_manifest(dataset_tree, ["agibot"])
+    pair = manifest["splits"]["train"][0]
+    # A nonzero pair start and irregular sampling exercise both row and timestamp alignment.
+    pair.update(start=1, num_frames=11, robot_frame_ids=[1, 2, 3, 5, 6, 7, 8, 9, 11], robot_sample_fps=8)
+    manifest["splits"]["train"] = [pair]
+    path = tmp_path / "windowed.json"
+    path.write_text(json.dumps(manifest))
+    dataset = HumanGenPairedDataset(dataset_tree, path, mode, robot_window_frames=5)
+    dataset.processor = SimpleNamespace(processor=Processor())
+    assert len(dataset) == 5
+    assert dataset.get_shuffle_blocks() == [(0, 5)]
+    for index in (0, 2, 4):
+        sample = dataset[index]
+        ids = pair["robot_frame_ids"][index : index + 5]
+        assert sample["robot_frame_ids"] == ids
+        assert sample["robot_window_start"] == index
+        assert sample["human_valid_frames"] == 9
+        assert sample["robot_valid_frames"] == 5
+        assert sample["action_valid_steps"] == ids[-1] - ids[0]
+        torch.testing.assert_close(sample["action_raw"][:, 0], torch.arange(ids[0], ids[-1]).float())
+        plan = sample["sequence_plan"]
+        assert plan.condition_frame_indexes_action == []
+        prefix = 1.2 if mode == "generator" else 0
+        np.testing.assert_allclose(
+            np.array(plan.vision_temporal_positions[-2:]) * 4 / 8,
+            [prefix, prefix + (ids[-1] - ids[0]) / 10],
+        )
+        if mode == "generator":
+            assert sample["video_segment_frames"] == [9, 5]
+            assert plan.condition_frame_indexes_vision == [0, 1, 2, 3]
+        else:
+            assert sample["video"].shape[1] == 5
+            assert plan.condition_frame_indexes_vision == [0]
+    assert dataset.pairs[0]["robot_frame_ids"] == pair["robot_frame_ids"]
+    assert dataset[-1]["sample_id"] == dataset[4]["sample_id"]
+    with pytest.raises(IndexError):
+        dataset[5]
+    stride_dataset = HumanGenPairedDataset(dataset_tree, path, mode, robot_window_frames=5, robot_window_stride=2)
+    assert len(stride_dataset) == 3
+    assert stride_dataset._window_pair(2)[1] == 4
+
+
+def test_window_index_skips_short_pairs(dataset_tree, tmp_path):
+    manifest = build_humangen_manifest(dataset_tree, ["agibot"])
+    pairs = manifest["splits"]["train"][:3]
+    pairs[0]["robot_frame_ids"] = list(range(5))
+    pairs[2]["robot_frame_ids"] = list(range(5))
+    manifest["splits"]["train"] = pairs
+    path = tmp_path / "short.json"
+    path.write_text(json.dumps(manifest))
+    dataset = HumanGenPairedDataset(dataset_tree, path, "generator", robot_window_frames=9)
+    assert len(dataset) == 1
+    assert dataset[0]["pair_id"] == pairs[1]["pair_id"]
+    assert dataset.get_shuffle_blocks() == [(0, 1)]
+    with pytest.raises(ValueError, match="No HumanGen windows"):
+        HumanGenPairedDataset(dataset_tree, path, "generator", robot_window_frames=13)
+    for invalid in (-1, 1, 4, 8, 5.5):
+        with pytest.raises(ValueError, match="robot_window_frames"):
+            HumanGenPairedDataset(dataset_tree, path, "generator", robot_window_frames=invalid)
+    with pytest.raises(ValueError, match="robot_window_stride"):
+        HumanGenPairedDataset(dataset_tree, path, "generator", robot_window_stride=0)
+
+
+def test_robotwin_window_actions_use_window_initial_pose():
+    from cosmos_framework.data.generator.action.datasets.humangen_preprocessing import process_actions
+
+    states = np.zeros((12, 16), dtype=np.float32)
+    states[:, [6, 14]] = 1
+    states[:, 0] = np.arange(12)
+    actions = states.copy()
+    actions[:, 0] += 0.5
+    table = pa.table({"action": actions.tolist(), "observation.state": states.tolist()})
+    contract = dict(kind="robotwin", q01=[-20.0] * 16, q99=[20.0] * 16)
+    window, _ = process_actions(table, 4, 9, contract)
+    np.testing.assert_allclose(window[:, 0], np.arange(5) + 0.5)
