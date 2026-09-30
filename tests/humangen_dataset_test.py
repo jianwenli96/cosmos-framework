@@ -648,3 +648,46 @@ def test_robotwin_window_actions_use_window_initial_pose():
     contract = dict(kind="robotwin", q01=[-20.0] * 16, q99=[20.0] * 16)
     window, _ = process_actions(table, 4, 9, contract)
     np.testing.assert_allclose(window[:, 0], np.arange(5) + 0.5)
+
+
+@pytest.mark.parametrize("mode", ["generator", "reasoner"])
+def test_episode_instruction_rebuilds_tokens_without_mutating_demo(dataset_tree, tmp_path, mode):
+    from types import SimpleNamespace
+
+    from cosmos_framework.evaluation.robotwin.policy import instruction_template
+
+    class Processor:
+        def apply_chat_template(self, messages, **kwargs):
+            return messages[0]["content"][1]["text"]
+
+        def __call__(self, **kwargs):
+            return dict(
+                input_ids=torch.tensor([[ord(c) for c in kwargs["text"][0]]]),
+                pixel_values_videos=torch.ones(9, 1),
+                video_grid_thw=torch.tensor([[9, 1, 1]]),
+            )
+
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(build_humangen_manifest(dataset_tree, ["agibot"])))
+    dataset = HumanGenPairedDataset(dataset_tree, path, mode, robot_window_frames=5)
+    dataset.processor = SimpleNamespace(processor=Processor())
+    dataset.transform.text_tokenizer = lambda data: dict(
+        data, text_token_ids=torch.tensor([ord(c) for c in data["ai_caption"]])
+    )
+    original_caption = dataset.pairs[0]["caption"]
+    original = dataset[0]
+    for instruction in ("Use the left arm on the red object", "Use the right arm on the blue object"):
+        sample = instruction_template(dataset, 0, 0, instruction)
+        assert sample["ai_caption"] == instruction
+        assert sample["text_token_ids"].tolist() == [ord(c) for c in instruction]
+        assert dataset.pairs[0]["caption"] == original_caption
+        assert not sample["action"].any() and not sample["action_raw"].any()
+        prefix = int(sample.get("human_demo_frames", 0))
+        assert not sample["video"][:, prefix:].any()
+        torch.testing.assert_close(sample["video"][:, :prefix], original["video"][:, :prefix])
+        assert sample["sequence_plan"].vision_temporal_positions == original["sequence_plan"].vision_temporal_positions
+        if mode == "reasoner":
+            torch.testing.assert_close(
+                sample["sequence_plan"].reasoner_video_input["pixel_values_videos"],
+                original["sequence_plan"].reasoner_video_input["pixel_values_videos"],
+            )
