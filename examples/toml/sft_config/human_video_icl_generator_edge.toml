@@ -23,11 +23,11 @@ weight_decay = 0.05
 fused = true
 
 [scheduler]
-cycle_lengths = [15000]
+cycle_lengths = [50000]
 warm_up_steps = [150]
 
 [trainer]
-max_iter = 15000
+max_iter = 50000
 logging_iter = 10
 grad_accum_iter = 1
 
@@ -39,4 +39,4 @@ vae_path = "${oc.env:WAN_VAE_PATH}"
 
 [checkpoint]
 load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
-save_iter = 2000
+save_iter = 5000
