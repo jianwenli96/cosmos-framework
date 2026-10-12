@@ -41,7 +41,8 @@ bash evaluation/robotwin/launch_server_multigpus.sh
 
 默认 `MODE=generator`、`COSMOS_DEVICE=npu`、`DEVICES=0,1,2,3,4,5,6`，
 监听 `0.0.0.0:8000～8006`。reasoner checkpoint 需设 `MODE=reasoner`；CUDA 模型设
-`COSMOS_DEVICE=cuda`。每个服务只使用一个模型设备。
+`COSMOS_DEVICE=cuda`。每个服务只使用一个模型设备。服务入口关闭训练配置中的 `fsdp_mixed_precision`，
+避免单卡无 FSDP 时启动报错；`IMAGINAIRE_OUTPUT_ROOT` 默认写入 `results/robotwin_model_output`。
 打印 `All seven services ready` 后保持前台运行；Ctrl-C 或任一服务退出时清理本批次服务。
 服务日志与示范映射默认写入 `results/robotwin_servers/时间戳_PID/`，可用 `LOG_ROOT` 覆盖。
 
@@ -135,14 +136,31 @@ reasoner 视频/文本联合输入，只缓存最近一条指令。新客户端�
 模板构建后清空离线机器人帧和动作，只填入实时三相机首帧；人类示范保持固定。
 当前服务没有跨请求 KV cache，不使用 Zero-WAM 的 reset/compute_kv_cache 协议。
 
-模型返回已反归一化的 `[T,16]` 动作：双臂 `[xyz, quaternion_xyzw, gripper]`。
-每轮以当前观测位姿还原整个 chunk：世界坐标平移相加、旋转 `R_current * R_relative`，
-gripper 保持绝对值。执行部分动作后重新观测，逐步检查成功和步数上限。
+模型返回已反归一化的 `[T,16]` 动作。现有 checkpoint 的训练代码直接将原始
+RoboTwin 四元数分量代入 SciPy xyzw 算法；部署 RoboTwin 的原始四元数实际为 wxyz。
+因此客户端必须保留观测的原始分量顺序，按训练算法的逆变换还原，然后原样传给
+`take_action`，不能仅在推理侧交换分量。每轮以当前观测还原整个 chunk：
+世界坐标平移相加、训练编码中的旋转相乘，gripper 保持绝对值。执行部分动作后重新观测，逐步检查成功和步数上限。
 训练监督是 `[first,last)`，所以不照搬 Zero-WAM 的 episode 初始参考与首轮历史动作块跳过。
 
 渲染默认匹配 Zero-WAM：材质/纹理上限 50000、rt shader、32 samples/pixel、路径深度 8、
 oidn 降噪，并做初始化检查。环境补齐 policy_name、ckpt_setting、save_root。
 专家不可解/UnStableError 跳过 seed，其他错误中止，避免吞掉配置错误。
+
+客户端在导入任务和创建场景前安装 SAPIEN RT 射线保护，修复已验证旧 shader 在
+纯黑完全吸收材质上生成零方向射线、继续调用 `traceRayEXT` 导致卡死的问题。
+实现位于 `cosmos_framework/evaluation/robotwin/render_guard.py`，移植自 lingbot-va-icl
+已验证的补丁：校验源文件与补丁 SHA256，仅修改进程私有 shader 副本；场景重置再次选择
+`rt` 时仍使用该副本。原始材质、光追与 OIDN 配置保持不变。
+
+`COSMOS_RT_RAY_GUARD=auto`（默认）只修复已知版本，未知版本记录
+`status=unrecognized_shader` 并保留原 shader；设为 `1` 可要求版本匹配，否则启动报错；
+设为 `0` 可关闭以做独立对照。兼容旧变量 `LINGBOT_RT_RAY_GUARD`，但 Cosmos 变量优先。
+`SKIP_RENDER_CHECK=1` 不会跳过此保护。日志和 `metrics.json` 的 `render_runtime`
+记录启用状态及 shader 哈希，启用时为 `rt_ray_guard=true`。
+比较 checkpoint 时应使用相同修复版本；修复可能改变黑色物体场景的采样图像。
+部署后应在仿真机器复测 `move_stapler_pad` seed 10000 和 `stamp_seal` seed 10020
+的完整闭环（单任务可用 `START_SEED` 指定），不能仅凭渲染初始化成功认定问题已解决。
 
 HTTP 接口为 `GET /info` 和 `POST /predict`；预测请求包含三个相机名对应的 base64 PNG、
 seed、必填 instruction，返回 action。与 Zero-WAM WebSocket/msgpack 不兼容。
@@ -154,14 +172,26 @@ seed、必填 instruction，返回 action。与 Zero-WAM WebSocket/msgpack 不�
 七任务串行/并行与两端独立调度的测试；实际 MP4 编解码和视角排列检查已通过。
 曾发现并修复任务与示范缺少校验、健康检查与推理代理行为不一致、固定 caption 未随场景更新的问题。
 
-尚未完成真实 SAPIEN/checkpoint 联调。SciPy xyzw 内部逆变换通过不等于外部接口已验证：
-实际数据 schema 只标注 q1～q4，仍需核对部署版本的 get_obs/take_action、四元数顺序、
-gripper 范围、控制步长、相机分辨率和 RGB 范围。没有证据时不自动交换四元数分量。
-先完成已知动作回放和单 episode，再运行 7 任务成功率测评。
+2026-10-05 已完成真实双机联调：本机 Ascend 910B / `cosmos-icl` 服务端，远端
+两张 H20 / `robotwin` 客户端，使用 `humangen_generator_window_17` 的 50000 步
+checkpoint。修复单卡服务继承 FSDP 混合精度和缺少输出根目录导致的启动失败，
+并移除启动脚本中会打印全部环境变量的裸 `export`。
+
+专家策略、保持姿态和 64 步训练动作回放均通过；回放末端位置误差约 0.42 mm。
+实际 `get_obs` / `take_action` 使用 wxyz，夹爪在环境内裁剪到 [0,1]，三相机
+输出 uint8 RGB。默认相机为 320×240，而训练视频为 640×480。
+
+七任务各一个 `demo_clean` episode（seed 100000，20 步模型采样，每次执行
+16 个动作）全部正常结束并保存录像，共 4193 个动作和 264 次推理。
+`open_microwave` 在第 593 步成功，其余六个任务达到步数上限而未成功。
+额外将相机提高到训练分辨率 640×480，`place_object_scale` 同 seed 对照
+仍在 400 步结束且未成功；未覆盖其他任务的高分辨率效果。
+这是链路冒烟测试，1/7 的观察结果不能视为稳定成功率或模型效果达标。
+详细配置、日志、指标和录像位于 `results/robotwin_validation_20261005_0328/`。
 
 ```bash
 # 昇腾环境先加载 CANN；纯 CPU 测试可禁用设备自动加载。
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest \
-  tests/robotwin_policy_test.py tests/robotwin_launchers_test.py \
+  tests/robotwin_policy_test.py tests/robotwin_launchers_test.py tests/robotwin_render_guard_test.py \
   --confcutdir=tests -o addopts='' -q
 ```

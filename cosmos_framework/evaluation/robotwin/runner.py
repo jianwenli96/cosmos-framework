@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from cosmos_framework.evaluation.robotwin.policy import RobotwinClient, rollout
+from cosmos_framework.evaluation.robotwin.render_guard import prepare_rt_ray_guard
 from cosmos_framework.evaluation.robotwin.simulation import EpisodeVideo, episode_instruction, initialize_renderer
 
 
@@ -68,6 +69,9 @@ def run_evaluation(args):
     # RoboTwin loads assets and task configs relative to its own checkout.
     sys.path.insert(0, str(root))
     os.chdir(root)
+    # Install before importing tasks: resets selecting "rt" must retain the fix.
+    # Skipping the render smoke check must not disable the shader workaround.
+    render_runtime = prepare_rt_ray_guard()
     from description.utils.generate_episode_instructions import generate_episode_descriptions
     from envs import CONFIGS_PATH
     from envs.utils.create_actor import UnStableError
@@ -94,6 +98,7 @@ def run_evaluation(args):
             instruction_type=args.instruction_type,
             episode_offset=args.episode_offset,
             renderer="robotwin_default" if args.skip_render_check else "zerowam_rt",
+            render_runtime=render_runtime,
             episodes=rows,
             rejected=rejected,
             successes=sum(row["success"] for row in rows),

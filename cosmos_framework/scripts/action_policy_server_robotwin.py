@@ -45,6 +45,8 @@ def main():
         parser.error("Closed-loop serving requires a window-trained checkpoint")
     overrides = _model_overrides_from_training_config(args.checkpoint, args.mode)
     overrides += [
+        # Training may use FSDP mixed precision; this server is a single unsharded model.
+        "model.config.fsdp_mixed_precision=False",
         f"model.config.tokenizer.vae_path={os.environ['WAN_VAE_PATH']}",
         f"model.config.vlm_config.tokenizer.tokenizer_type={os.environ['COSMOS3_EDGE_PROCESSOR_PATH']}",
     ]

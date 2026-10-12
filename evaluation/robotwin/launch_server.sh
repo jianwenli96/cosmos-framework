@@ -17,20 +17,16 @@ fi
 
 # 选择模型设备
 if [[ ${COSMOS_DEVICE:-cuda} == npu ]]; then
-  export
   export ASCEND_RT_VISIBLE_DEVICES="$4"
 else
-  export
   export CUDA_VISIBLE_DEVICES="$4"
 fi
 
 # Each task is an independent single-device server, even inside a torchrun shell.
-export
 export WORLD_SIZE=1
 export RANK=0
 export LOCAL_RANK=0
 export MASTER_ADDR=127.0.0.1
-export
 export MASTER_PORT=$(($3 + 10000))
 
 # 启动单任务推理服务

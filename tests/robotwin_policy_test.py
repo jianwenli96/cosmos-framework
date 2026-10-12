@@ -221,6 +221,15 @@ def test_client_episode_passes_scene_instruction_and_runtime_config(tmp_path, mo
     from cosmos_framework.evaluation.robotwin import runner
     from cosmos_framework.scripts import eval_robotwin
 
+    render_runtime = {"rt_ray_guard": True, "status": "zero_direction_guard"}
+    guard_calls = []
+
+    def prepare_guard():
+        guard_calls.append(True)
+        return render_runtime
+
+    monkeypatch.setattr(runner, "prepare_rt_ray_guard", prepare_guard)
+
     class Env:
         take_action_cnt = 0
         step_lim = 3
@@ -228,6 +237,7 @@ def test_client_episode_passes_scene_instruction_and_runtime_config(tmp_path, mo
         plan_success = True
 
         def setup_demo(self, **config):
+            assert guard_calls == [True]
             assert config["policy_name"] == "cosmos_icl"
             assert config["save_root"] == str(tmp_path / "output")
             self.take_action_cnt = 0
@@ -311,3 +321,4 @@ def test_client_episode_passes_scene_instruction_and_runtime_config(tmp_path, mo
     result = json.loads((tmp_path / "output/metrics.json").read_text())
     assert result["episodes"][0]["instruction"] == "Stamp green"
     assert result["successes"] == 1
+    assert result["render_runtime"] == render_runtime
